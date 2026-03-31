@@ -15,12 +15,14 @@ document.addEventListener('DOMContentLoaded', () => {
   if (mobileMenuToggle && navLinks) {
     mobileMenuToggle.addEventListener('click', () => {
       navLinks.classList.toggle('open');
+      navbar.classList.toggle('menu-open');
       mobileMenuToggle.textContent = navLinks.classList.contains('open') ? '✕' : '☰';
     });
     // Close menu when clicking a link
     navLinks.querySelectorAll('a').forEach(link => {
       link.addEventListener('click', () => {
         navLinks.classList.remove('open');
+        navbar.classList.remove('menu-open');
         mobileMenuToggle.textContent = '☰';
       });
     });

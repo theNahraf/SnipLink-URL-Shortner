@@ -47,6 +47,10 @@
   backdrop-filter: blur(20px);
   border-bottom: 1px solid var(--border-subtle);
 }
+.navbar.menu-open {
+  backdrop-filter: none !important;
+  background: var(--bg-primary) !important;
+}
 .navbar-inner {
   display: flex;
   align-items: center;
