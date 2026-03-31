@@ -11,6 +11,23 @@ document.addEventListener('DOMContentLoaded', () => {
     if (loginBtn) { loginBtn.textContent = 'Dashboard'; loginBtn.href = '/dashboard'; }
     if (signupBtn) signupBtn.style.display = 'none';
   }
+
+  // ---- Mobile Menu Toggle ----
+  const mobileMenuToggle = document.getElementById('mobileMenuToggle');
+  const navLinks = document.getElementById('navLinks');
+  if (mobileMenuToggle && navLinks) {
+    mobileMenuToggle.addEventListener('click', () => {
+      navLinks.classList.toggle('open');
+      mobileMenuToggle.textContent = navLinks.classList.contains('open') ? '✕' : '☰';
+    });
+    // Close menu when clicking a link
+    navLinks.querySelectorAll('a').forEach(link => {
+      link.addEventListener('click', () => {
+        navLinks.classList.remove('open');
+        mobileMenuToggle.textContent = '☰';
+      });
+    });
+  }
 });
 
 // ---- Subscribe ----

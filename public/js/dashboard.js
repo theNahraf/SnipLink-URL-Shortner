@@ -520,6 +520,11 @@ function handleRouteChange() {
 }
 
 function switchView(view) {
+  const sidebar = document.getElementById('sidebar');
+  const overlay = document.getElementById('sidebarOverlay');
+  if(sidebar) sidebar.classList.remove('open');
+  if(overlay) overlay.classList.remove('open');
+
   if (window.location.hash.replace('#', '') !== view) {
     window.location.hash = view; // Triggers handleRouteChange
   } else {
@@ -529,7 +534,10 @@ function switchView(view) {
 
 // ---- Mobile Sidebar ----
 function toggleSidebar() {
-  document.getElementById('sidebar').classList.toggle('open');
+  const sidebar = document.getElementById('sidebar');
+  const overlay = document.getElementById('sidebarOverlay');
+  if(sidebar) sidebar.classList.toggle('open');
+  if(overlay) overlay.classList.toggle('open');
 }
 
 // ---- Logout ----
