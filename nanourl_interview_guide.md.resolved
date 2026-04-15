@@ -1,0 +1,839 @@
+# 🔗 NanoURL — Complete Interview Study Guide
+
+> **Project Name:** NanoURL (URL Shortener SaaS)
+> **Stack:** Node.js · Express · PostgreSQL · Redis · BullMQ · Razorpay · Docker
+> **GitHub:** `theNahraf/URL-Shortner`
+
+---
+
+## 1. 🗂️ What Is This Project?
+
+NanoURL is a **production-grade, SaaS URL Shortener** — similar to Bitly or TinyURL — but built from scratch with full understanding of the internals. It converts long URLs like `https://example.com/very-long-path?with=params` into short ones like `nanourl.io/aB3xY`.
+
+### Core Features
+| Feature | Description |
+|---|---|
+| URL Shortening | Generate a unique 5-char code for any URL |
+| Custom Aliases | Pro users can pick their own short code (`/mylink`) |
+| Password Protection | Protect links behind a password |
+| Expiry Dates | Links that auto-expire after a set time |
+| One-Time Links | Link deactivates after first click |
+| Click Analytics | Track clicks by country, browser, device, referrer |
+| Time-Series Charts | Daily/weekly/hourly click trends |
+| QR Code Generation | Generate QR codes for any link |
+| User Auth | JWT-based signup, login, refresh token |
+| Plans & Billing | Free / Pro / Business tiers via Razorpay subscriptions |
+| Rate Limiting | Redis Token Bucket limiter per plan tier |
+| Swagger API Docs | Auto-generated at `/api-docs` |
+| Domain Blacklist | Block malicious/phishing URLs |
+| Docker Support | Full dev stack in docker-compose |
+
+---
+
+## 2. 🧱 Technology Stack — What I Used & WHY
+
+### Node.js + Express
+- **Why Node?** Event-loop driven, non-blocking I/O is perfect for high-throughput redirect operations. URL shorteners are I/O bound (DB reads, cache lookups), not CPU bound.
+- **Why Express?** Minimal, unopinionated. Gives full control over routing, middleware order, and error handling. No magic like NestJS.
+
+### PostgreSQL (via Knex.js query builder)
+- **Why PostgreSQL?** ACID transactions, strong indexing, `date_trunc` for time-series analytics, `inet` type for IP storage, `gen_random_uuid()` built-in.
+- **Why not MySQL?** PostgreSQL has better analytical query support (`date_trunc`, window functions) needed for click analytics.
+- **Why Knex.js?** Gives raw SQL power with a JS-friendly API. Has migrations built-in. More control than Sequelize ORM.
+- **Connection Pool:** min=2, max=10 (dev) / max=20 (prod) to handle concurrent requests efficiently.
+
+### Redis (via ioredis)
+- **Why Redis?** Sub-millisecond lookups. A URL redirect should happen in <5ms — you can't afford a DB hit every time.
+- **Usage 1 — Cache:** Short codes cached for 1 hour (`url:<shortCode>` → `longUrl`)
+- **Usage 2 — Rate Limiting:** Token bucket stored as Redis hash per user/IP
+- **Usage 3 — Blacklist:** Malicious domains stored in a Redis Set for O(1) lookup
+- **Usage 4 — BullMQ:** Analytics jobs queued through Redis
+- **Why ioredis?** Better performance and cluster support than the `redis` npm package.
+
+### BullMQ (Job Queue)
+- **Why a job queue?** Analytics (GeoIP lookup, DB insert) should NOT block the redirect. A user clicks → they get redirected in ~2ms → analytics written asynchronously.
+- **Why BullMQ?** Built for Redis, supports retries with exponential backoff, concurrency control, job TTL. Production-ready.
+- **Retry Policy:** 3 attempts with exponential backoff (1s, 2s, 4s).
+
+### JWT (jsonwebtoken)
+- **Why JWT?** Stateless — no server-side session storage needed. Scales horizontally. Access token (15 min) + Refresh token (7 days) pattern.
+- **Why two tokens?** Access token is short-lived for security. Refresh token gives users seamless experience without logging in every 15 minutes.
+- **Token storage:** Sent in cookies AND supported in `Authorization: Bearer` header (works for both browser clients and API clients).
+
+### bcrypt
+- **Why bcrypt?** Adaptive hashing — the cost factor makes it intentionally slow to brute-force. SALT_ROUNDS = 12 means ~400ms to hash — acceptable for login but costly for attackers.
+- **Used for:** Password hashing (users) AND link password hashing.
+
+### Razorpay
+- **Why Razorpay?** Indian payment gateway, supports recurring subscriptions natively, no card required for test mode, excellent webhook support.
+- **How it works:** Create subscription → Razorpay charges user monthly → Webhook fires → DB updated with new plan.
+- **Webhook security:** HMAC-SHA256 signature verification to prevent fake events.
+
+### Helmet
+- **Why?** Sets critical HTTP security headers (CSP, HSTS, X-Frame-Options, XSS-Protection). One middleware, 10+ security wins.
+
+### Compression
+- **Why?** gzip/brotli compress API responses. Especially useful for analytics responses that may have large JSON data.
+
+### Morgan
+- **Why?** HTTP request logging. `dev` format in development (colored), `combined` (Apache-standard) in production for log aggregation tools.
+
+### geoip-lite
+- **Why?** Offline GeoIP lookup — no external API call, no latency, no cost. The IP-to-country mapping is bundled in the package.
+- **Trade-off:** Less accurate than MaxMind paid API, but good enough for analytics.
+
+### ua-parser-js
+- **Why?** Parse User-Agent strings to extract browser, OS, device type. Used in the analytics worker to categorize clicks.
+
+### qrcode
+- **Why?** QR code generation for links. Output as base64 PNG, returned via API. No external service needed.
+
+### Docker + Docker Compose
+- **Why Docker?** Reproducible local environment. `docker-compose up` spins up PostgreSQL + Redis instantly.
+- **Redis config:** `appendonly yes` (persistent), `maxmemory 256mb`, `allkeys-lru` eviction policy.
+
+### Swagger (swagger-jsdoc + swagger-ui-express)
+- **Why?** Auto-generated API documentation from JSDoc comments in route files. Always in sync with code.
+
+---
+
+## 3. 🏗️ High-Level Design (HLD)
+
+```
+┌─────────────────────────────────────────────────┐
+│                    CLIENT LAYER                  │
+│  Browser (Landing, Dashboard, Login, Signup,     │
+│  Pricing) — Vanilla HTML/CSS/JS (SPA-like)       │
+└──────────────────────┬──────────────────────────┘
+                       │ HTTP/HTTPS
+                       ▼
+┌─────────────────────────────────────────────────┐
+│              API SERVER (Express.js)             │
+│                                                  │
+│  ┌──────────┐  ┌──────────┐  ┌───────────────┐ │
+│  │ Auth API │  │  URL API │  │ Analytics API  │ │
+│  │/api/auth │  │   /api   │  │/api/analytics  │ │
+│  └──────────┘  └──────────┘  └───────────────┘ │
+│                                                  │
+│  ┌────────────────────────────────────────────┐ │
+│  │           Middleware Stack                  │ │
+│  │ Helmet → CORS → Compression → Morgan →     │ │
+│  │ BodyParser → CookieParser → JWT Auth →     │ │
+│  │ Rate Limiter (Redis Token Bucket)           │ │
+│  └────────────────────────────────────────────┘ │
+└────────────┬──────────────────────┬─────────────┘
+             │                      │
+             ▼                      ▼
+  ┌─────────────────┐    ┌────────────────────┐
+  │   PostgreSQL     │    │       Redis         │
+  │                  │    │                      │
+  │  users table     │    │  URL Cache (1hr)     │
+  │  urls table      │    │  Rate Limit Buckets  │
+  │  analytics table │    │  Domain Blacklist    │
+  │                  │    │  BullMQ Queue        │
+  └─────────────────┘    └──────────┬───────────┘
+                                     │
+                                     ▼
+                          ┌───────────────────┐
+                          │  Analytics Worker  │
+                          │   (BullMQ Worker)  │
+                          │                    │
+                          │  Parse UserAgent   │
+                          │  GeoIP Lookup      │
+                          │  DB Insert         │
+                          └───────────────────┘
+                                     
+                          ┌───────────────────┐
+                          │    Razorpay API    │
+                          │  (Payments SaaS)   │
+                          └───────────────────┘
+```
+
+### HLD Summary
+- The Express server is the single backend that serves both the **static frontend** and the **REST API**.
+- Redis acts as both a **cache** and a **message broker** (via BullMQ).
+- Analytics are **decoupled** from the critical redirect path using a background worker.
+- Payments are **event-driven** — Razorpay tells us when a user upgrades via webhooks.
+
+---
+
+## 4. 🔬 Low-Level Design (LLD)
+
+### 4.1 URL Shortening Flow (POST /api/shorten)
+
+```
+Client Request
+     │
+     ▼
+optionalAuth (attach user if JWT present)
+     │
+     ▼
+createRateLimiter('shorten') — Redis Token Bucket check
+     │
+     ▼
+validate(url required) — express middleware
+     │
+     ▼
+urlController.shortenUrl()
+     │
+     ├── validateUrl(longUrl)
+     │     ├── validator.isURL() — must be http/https
+     │     ├── max 2048 chars check
+     │     ├── suspicious pattern check (.exe, javascript:, data:)
+     │     └── re-shortening check (bit.ly etc blocked)
+     │
+     ├── isBlacklisted(longUrl) — Redis SISMEMBER O(1)
+     │
+     ├── Check plan limits (free: 100 links/month max)
+     │
+     ├── If customAlias:
+     │     ├── Validate format [a-zA-Z0-9_-] 3-30 chars
+     │     ├── Requires Pro+ plan
+     │     └── Check uniqueness in DB
+     │
+     ├── Else: Generate shortCode
+     │     └── crypto.randomBytes(5) → Base62 mapping
+     │         Until unique (DB check loop)
+     │
+     ├── If password: bcrypt.hash(password, 10)
+     │
+     ├── DB INSERT into urls table
+     │
+     ├── Redis SET url:<shortCode> longUrl (EX 3600)
+     │
+     └── Increment user.links_created_this_month
+```
+
+---
+
+### 4.2 URL Redirect Flow (GET /:shortCode)
+
+```
+GET /aB3xY
+     │
+     ▼
+optionalAuth — attach user if logged in (for rate limit tier)
+     │
+     ▼
+createRateLimiter('redirect') — different limits per tier
+     │
+     ▼
+urlController.redirectUrl()
+     │
+     ▼
+resolveUrl('aB3xY', requestMeta)
+     │
+     ├── Redis GET url:aB3xY
+     │     ├── HIT: get longUrl from cache (~0.1ms)
+     │     │   └── Still fetch DB record for metadata check
+     │     └── MISS: DB SELECT WHERE short_code = 'aB3xY'
+     │               └── Cache the result for next time
+     │
+     ├── Check is_active → 404 if false
+     │
+     ├── Check expires_at → 410 Gone if expired
+     │     └── Also del from Redis cache
+     │
+     ├── Check password_hash
+     │     └── bcrypt.compare(provided, hash)
+     │
+     ├── One-time link: set is_active=false, del Redis cache
+     │
+     ├── Increment click_count (inline DB update)
+     │
+     ├── Queue analytics job to BullMQ (async, non-blocking)
+     │     Data: { urlId, ip, userAgent, referer, timestamp }
+     │
+     └── res.redirect(301|302, longUrl)
+                  │
+                  ▼
+         Analytics Worker picks up job:
+           • ua-parser-js → browser, device, OS
+           • geoip-lite → country, city
+           • DB INSERT into analytics table
+```
+
+**Why 301 vs 302?**
+- Regular links → **301 Permanent** (browser caches, reduces future server load)
+- One-time links → **302 Temporary** (browser should NOT cache, each click must hit server)
+
+---
+
+### 4.3 Rate Limiting — Token Bucket Algorithm (LLD)
+
+The rate limiter uses a **Token Bucket** algorithm, implemented atomically in Redis using a **Lua script**.
+
+**Why Lua?** Lua scripts run atomically in Redis — no race conditions between the READ-MODIFY-WRITE operations.
+
+```lua
+-- Lua script (runs atomically in Redis)
+HMGET key → get current tokens, last_refill_time
+elapsed = now - last_refill
+refill = floor(elapsed / 1000 * max_tokens / interval)
+tokens = min(max_tokens, tokens + refill)
+IF tokens > 0:
+  tokens -= 1
+  allowed = 1
+HMSET key tokens last_refill
+EXPIRE key interval*2
+RETURN [allowed, tokens, reset_in]
+```
+
+**Rate Limit Tiers:**
+| Tier | Shorten | Redirect | Analytics | General |
+|---|---|---|---|---|
+| Unauthenticated | 5/min | 50/min | 5/min | 30/min |
+| Free | 10/min | 100/min | 20/min | 60/min |
+| Pro | 60/min | 1000/min | 100/min | 300/min |
+| Business | 200/min | 5000/min | 500/min | 1000/min |
+
+**Rate Limit Key:** `ratelimit:<action>:user:<userId>` or `ratelimit:<action>:ip:<ip>`
+
+**Fail-open:** If Redis is down, the middleware calls `next()` — rate limiting degrades gracefully.
+
+---
+
+### 4.4 Authentication Flow (LLD)
+
+```
+POST /api/auth/signup
+  → validate email + password (min 8 chars)
+  → check duplicate email (case-insensitive)
+  → bcrypt.hash(password, 12) — 12 salt rounds
+  → INSERT user (UUID primary key, plan_type='free')
+  → generateTokens(user) — access + refresh JWT
+  → Return tokens + user info
+
+POST /api/auth/login
+  → DB SELECT user by email (lowercased)
+  → bcrypt.compare(password, hash)
+  → generateTokens(user)
+  → Tokens returned (stored in browser cookies + localStorage)
+
+POST /api/auth/refresh
+  → jwt.verify(refreshToken, JWT_REFRESH_SECRET)
+  → Sign new accessToken with JWT_SECRET
+  → Return { accessToken }
+
+JWT Payload: { id, email, plan_type }
+Access Token: 15 minutes
+Refresh Token: 7 days
+```
+
+**Token extraction in middleware:**
+1. Check `Authorization: Bearer <token>` header (for API clients)
+2. Fallback to `req.cookies.access_token` (for browser)
+
+**optionalAuth vs authenticate:**
+- `authenticate` → **blocks** if no token. Used for protected routes.
+- `optionalAuth` → **never blocks**, attaches user if token present. Used for redirects (to determine rate limit tier).
+
+---
+
+### 4.5 Analytics System (LLD)
+
+**Why async analytics?**
+The redirect latency budget is ~5ms. GeoIP lookup + DB insert would add ~20ms. So analytics are queued.
+
+```
+Click happens
+  └── click_count++ (fast inline DB update)
+  └── analyticsQueue.add('track-click', { urlId, ip, userAgent, referer })
+  └── HTTP redirect (user gets URL immediately)
+
+[Background — BullMQ Worker]
+  └── Job picked up by analyticsWorker.js
+  └── UAParser(userAgent) → { device, browser, os }
+  └── geoip.lookup(ip) → { country, city }
+  └── DB INSERT into analytics table
+```
+
+**Analytics queries use PostgreSQL date_trunc:**
+```sql
+SELECT date_trunc('day', created_at) as time_bucket,
+       COUNT(*) as clicks,
+       COUNT(DISTINCT ip_address) as unique_clicks
+FROM analytics
+WHERE url_id = ? AND created_at >= ?
+GROUP BY time_bucket
+ORDER BY time_bucket ASC;
+```
+
+---
+
+## 5. 🗄️ Database Schema (LLD)
+
+### `users` table
+```
+id                       UUID PRIMARY KEY (gen_random_uuid())
+email                    VARCHAR(255) UNIQUE NOT NULL
+password_hash            VARCHAR(255) NOT NULL
+display_name             VARCHAR(100)
+plan_type                ENUM('free', 'pro', 'business') DEFAULT 'free'
+razorpay_customer_id     VARCHAR(100)
+razorpay_subscription_id VARCHAR(100)
+links_created_this_month INTEGER DEFAULT 0
+billing_cycle_start      TIMESTAMP DEFAULT NOW()
+created_at               TIMESTAMP
+updated_at               TIMESTAMP
+INDEX: email
+```
+
+**Why UUID for users?** Security — sequential integer IDs leak user count. UUIDs are unpredictable.
+
+### `urls` table
+```
+id           BIGSERIAL PRIMARY KEY
+short_code   VARCHAR(12) UNIQUE NOT NULL
+long_url     TEXT NOT NULL
+user_id      UUID REFERENCES users(id) ON DELETE CASCADE  -- nullable (anonymous)
+custom_alias BOOLEAN DEFAULT FALSE
+password_hash VARCHAR(255)                                 -- nullable
+expires_at   TIMESTAMP                                     -- nullable
+one_time     BOOLEAN DEFAULT FALSE
+is_active    BOOLEAN DEFAULT TRUE
+click_count  INTEGER DEFAULT 0
+title        VARCHAR(255)
+created_at   TIMESTAMP
+updated_at   TIMESTAMP
+INDEXES: short_code, user_id, created_at
+```
+
+### `analytics` table
+```
+id         BIGSERIAL PRIMARY KEY
+url_id     BIGINT REFERENCES urls(id) ON DELETE CASCADE NOT NULL
+ip_address INET                          -- PostgreSQL native IP type
+country    VARCHAR(100)
+city       VARCHAR(100)
+device     VARCHAR(50)
+browser    VARCHAR(50)
+os         VARCHAR(50)
+referer    TEXT
+created_at TIMESTAMP DEFAULT NOW()
+INDEXES: url_id, created_at, (url_id, created_at) composite
+```
+
+**Why `INET` type?** PostgreSQL's native IP type supports both IPv4 and IPv6.
+
+**Why composite index `(url_id, created_at)`?** Analytics queries always filter by `url_id` first, then time range. Composite index serves both.
+
+---
+
+## 6. 📡 API Design
+
+### Auth Routes (`/api/auth`)
+| Method | Endpoint | Auth | Description |
+|---|---|---|---|
+| POST | `/signup` | No | Register new user |
+| POST | `/login` | No | Login |
+| POST | `/refresh` | No | Refresh access token |
+| POST | `/logout` | No | Clear cookies |
+| GET | `/profile` | Yes | Get user profile + stats |
+
+### URL Routes (`/api`)
+| Method | Endpoint | Auth | Description |
+|---|---|---|---|
+| POST | `/shorten` | Optional | Shorten a URL |
+| GET | `/links` | Yes | Get user's links (paginated) |
+| GET | `/links/:id` | Yes | Get single link |
+| PUT | `/links/:id` | Yes | Update link |
+| DELETE | `/links/:id` | Yes | Delete link |
+| GET | `/links/:id/qr` | Yes | Get QR code (base64 PNG) |
+
+### Analytics Routes (`/api/analytics`)
+| Method | Endpoint | Auth | Description |
+|---|---|---|---|
+| GET | `/:id` | Yes | Full analytics for a link |
+| GET | `/:id/timeseries` | Yes | Time-series clicks |
+| GET | `/dashboard` | Yes | Dashboard overview stats |
+
+### Payment Routes (`/api/payments`)
+| Method | Endpoint | Auth | Description |
+|---|---|---|---|
+| POST | `/subscribe` | Yes | Create Razorpay subscription |
+| POST | `/webhook` | No | Handle Razorpay webhook |
+| GET | `/status` | Yes | Get subscription status |
+
+### Redirect Route
+```
+GET /:shortCode  (regex: [a-zA-Z0-9_-]{3,30})
+Defined AFTER all /api routes and page routes
+```
+
+---
+
+## 7. 📁 Project Structure Explained
+
+```
+url-shortner/
+├── src/
+│   ├── server.js          Entry point — starts the app, graceful shutdown
+│   ├── app.js             Express app setup, middleware chain, route mounting
+│   ├── config/
+│   │   ├── env.js         Load & validate all env variables
+│   │   ├── database.js    Knex DB connection instance (singleton)
+│   │   └── redis.js       ioredis instance + BullMQ connection factory
+│   ├── routes/            Route definitions + Swagger JSDoc comments
+│   ├── controllers/       HTTP request/response handlers (thin layer)
+│   ├── services/          Business logic (thick layer, most code here)
+│   ├── middleware/
+│   │   ├── auth.js        JWT authenticate + optionalAuth
+│   │   ├── rateLimiter.js Token bucket rate limiter (Redis + Lua)
+│   │   ├── validator.js   Request body validation middleware
+│   │   └── errorHandler.js Central error handler + AppError class
+│   ├── utils/
+│   │   ├── snowflake.js   Snowflake ID generator (64-bit unique IDs)
+│   │   ├── base62.js      Base62 encoder/decoder
+│   │   ├── blacklist.js   Domain blacklist (Redis Set)
+│   │   └── urlValidator.js URL safety validation
+│   ├── workers/
+│   │   └── analyticsWorker.js BullMQ worker for async analytics
+│   └── db/migrations/     Knex migration files (versioned DB schema)
+├── public/                Frontend (static HTML/CSS/JS, served by Express)
+│   ├── index.html         Landing page
+│   ├── dashboard.html     User dashboard
+│   ├── login.html / signup.html / pricing.html / password.html
+│   └── js/ css/
+├── Dockerfile
+├── docker-compose.yml     Local dev: PostgreSQL + Redis
+├── knexfile.js            Knex DB config (dev + prod)
+└── package.json
+```
+
+**Architecture Pattern: Layered (MVC + Service Layer)**
+- Routes → define endpoints, apply middleware chain
+- Controllers → handle HTTP, call services, send responses
+- Services → all business logic, DB queries, cache operations
+- Utils → pure utility functions (no side effects)
+- Middleware → cross-cutting concerns
+
+---
+
+## 8. 🔑 Key Design Decisions & Why
+
+### 8.1 Snowflake ID Generator
+Twitter-inspired 64-bit unique ID:
+```
+[1 bit sign][41 bits timestamp][10 bits machineId][12 bits sequence]
+```
+- Custom Epoch: 2026-01-01 → fits in 41 bits for ~69 years
+- **Why?** Globally unique without DB coordination. Works across distributed nodes.
+- **4096 IDs/ms** per machine without collision.
+- **Machine ID:** Configurable via `MACHINE_ID` env var.
+
+### 8.2 Base62 Encoding
+- Charset: `0-9 a-z A-Z` (62 chars)
+- A 64-bit Snowflake ID → 6-8 character Base62 string
+- URL-safe (no `+`, `/`, `=` like Base64)
+- 62^5 = ~916 million possible 5-char codes
+
+### 8.3 Cache Strategy
+- **Write-through cache:** On URL creation, immediately cached in Redis
+- **Cache invalidation:** On URL update/delete, Redis key deleted
+- **TTL:** 1 hour (3600 seconds)
+- **Key pattern:** `url:<shortCode>`
+
+### 8.4 One-Time Links — 301 vs 302
+- One-time → 302 (temporary), prevents browser caching
+- Permanent → 301 (permanent), browser caches, offloads server
+
+### 8.5 Fail-Open vs Fail-Closed
+- Rate limiter: **Fail-Open** (if Redis down, allow requests) — availability > strict limiting
+- Auth middleware: **Fail-Closed** (if JWT invalid, reject) — security > availability
+
+### 8.6 Anonymous vs Authenticated Shortening
+- Anonymous users CAN create links (no account needed)
+- `user_id` in `urls` table is nullable
+- This is a growth strategy: let anonymous users try → convert to paid
+
+---
+
+## 9. 🌐 Frontend & Route Order
+
+The frontend is static HTML served by Express. Route order in `app.js` is critical:
+
+```javascript
+// 1. Static assets (/public) - CSS, JS files
+app.use(express.static('public'));
+
+// 2. API routes (/api/...) - most specific
+app.use('/api/auth', authRoutes);
+app.use('/api', urlRoutes);
+
+// 3. Named pages (/dashboard, /login, etc.)
+['dashboard','login','signup','pricing'].forEach(page => {
+  app.get(`/${page}`, sendFile(`${page}.html`));
+});
+
+// 4. Short code redirect wildcard — MUST be last
+app.get('/:shortCode([a-zA-Z0-9_-]{3,30})', redirectHandler);
+
+// 5. 404 → serve index.html (SPA-like fallback)
+```
+
+**Why this order matters:** If wildcard was first, `/dashboard` would be treated as a short code lookup!
+
+---
+
+## 10. 🐳 DevOps & Infrastructure
+
+### Docker Compose (Local Dev)
+```
+postgres:16-alpine → Port 15432 (avoid clash with local Postgres)
+redis:7-alpine     → Port 16379 (avoid clash with local Redis)
+```
+Redis config: `appendonly yes` + `maxmemory 256mb` + `allkeys-lru` eviction
+
+### Graceful Shutdown
+```javascript
+process.on('SIGTERM', () => process.exit(0));
+process.on('SIGINT',  () => process.exit(0));
+```
+
+### Key Environment Variables
+| Variable | Description |
+|---|---|
+| `DATABASE_URL` | PostgreSQL connection string (REQUIRED) |
+| `JWT_SECRET` | Access token signing key (REQUIRED) |
+| `JWT_REFRESH_SECRET` | Refresh token signing key (REQUIRED) |
+| `REDIS_URL` | Redis URL (default: redis://localhost:6379) |
+| `PORT` | Server port (default: 3000) |
+| `BASE_URL` | Public URL of the app |
+| `MACHINE_ID` | Snowflake machine ID (default: 1) |
+| `RATE_LIMIT_ENABLED` | Enable/disable rate limiting |
+| `RAZORPAY_KEY_ID/SECRET` | Razorpay credentials |
+
+---
+
+## 11. 🔐 Security Measures
+
+| Threat | Mitigation |
+|---|---|
+| Brute force login | Rate limiting (5/min unauthenticated) |
+| XSS | Helmet security headers |
+| Clickjacking | Helmet X-Frame-Options |
+| Malicious URLs | URL validator + Redis blacklist |
+| Re-shortening chains | Block known shortener domains |
+| SQL injection | Knex parameterized queries |
+| IDOR | All DB queries scope by `user_id` |
+| Weak passwords | bcrypt with 12 salt rounds |
+| JWT tampering | HMAC-signed JWT, verified on every request |
+| Payment fraud | HMAC-SHA256 webhook signature verification |
+| Username enumeration | Generic "Invalid email or password" message |
+| Proxy bypass | `trust proxy` setting for real IP detection |
+
+---
+
+## 12. 📊 Performance Optimizations
+
+| Optimization | Where | Why |
+|---|---|---|
+| Redis cache | URL redirect | Sub-ms lookup vs ~5ms DB query |
+| Async analytics | BullMQ worker | Redirect not blocked by GeoIP + DB write |
+| Gzip compression | All API responses | ~70% size reduction |
+| DB indexes | short_code, user_id, (url_id, created_at) | Fast lookups |
+| Connection pooling | Knex (min 2, max 20) | Reuse DB connections |
+| click_count denorm | urls table | Dashboard stat without COUNT join |
+| Promise.all | getUserLinks | Count + data queries run in parallel |
+| Lua atomic ops | Rate limiter | Atomic Redis read-modify-write |
+
+---
+
+## 13. 🎯 Interview Questions & Answers
+
+### System Design Questions
+
+**Q1: Why did you use Redis for caching instead of in-memory (like a Map)?**
+> In-memory cache is per-process and doesn't scale horizontally. If you run 3 Node.js instances behind a load balancer, each has its own Map — one might cache miss while others have data. Redis is a **shared external cache** visible to all instances. Also, Redis persists across server restarts.
+
+**Q2: How does your URL shortening handle collisions?**
+> I generate a 5-character code using `crypto.randomBytes(5)` mapped to Base62 charset. If it already exists in the DB, I loop and generate another. With 62^5 = ~916 million possible codes, collisions are rare. At scale, you'd use **pre-generated batches** or the **Snowflake + Base62** approach which is guaranteed unique without any DB check.
+
+**Q3: What happens if Redis goes down?**
+> The system degrades gracefully:
+> - Rate limiter: **fail-open** (allow all requests, log error)
+> - Short code redirect: falls back to PostgreSQL (cache miss path always works)
+> - BullMQ: failsafe try/catch, analytics just won't queue
+> The Redirect always works because PostgreSQL is the source of truth.
+
+**Q4: How would you scale this to handle 100M URLs?**
+> - **Horizontal scaling:** Multiple Node.js instances behind load balancer (shared Redis cache already works)
+> - **DB sharding:** Shard urls table by `short_code` hash
+> - **Read replicas:** Analytics queries (heavy reads) go to replicas
+> - **CDN caching:** Cloudflare in front — cache 301 redirects at edge nodes
+> - **Pre-computed short codes:** Generate codes in batches into a Redis pool, pop one when needed — eliminates the uniqueness check loop
+> - **Separate analytics DB:** Move analytics to ClickHouse or TimescaleDB for better time-series performance
+
+**Q5: Why not use MongoDB instead of PostgreSQL?**
+> URLs + user data are **relational** — users OWN urls, analytics belong TO urls. PostgreSQL's foreign keys with `ON DELETE CASCADE` handle cleanup automatically. PostgreSQL also has `date_trunc`, `inet` type, and window functions used directly for analytics. MongoDB would require application-level joins and custom IP handling.
+
+**Q6: Explain the Token Bucket algorithm and why you chose it over Fixed Window.**
+> **Fixed Window:** Count requests in a 60-second window. Flaw: a user can make 2x their limit if they burst at the window boundary (59th second of window 1 + 1st second of window 2).
+> **Token Bucket:** Tokens refill smoothly over time. You can burst up to max_tokens but then refill at max/interval rate. It handles bursty traffic gracefully — better user experience. Implemented atomically with a Lua script to prevent race conditions.
+
+**Q7: Why did you use two Redis connections (one for app, one for BullMQ)?**
+> BullMQ needs `maxRetriesPerRequest: null` and `enableReadyCheck: false` for its blocking list operations (`BRPOP`). Using the same connection would conflict with main app settings. Standard practice: one connection for app operations, one for BullMQ.
+
+**Q8: How do you handle the ordering of Express routes to prevent conflicts?**
+> Order: Static files → API routes → Named pages → Short code wildcard → 404 handler. If the wildcard was before named pages, `/dashboard` would be treated as a short code lookup. **Specificity first, wildcards last.**
+
+---
+
+### Security Questions
+
+**Q9: Why do you use two JWT tokens (access + refresh)?**
+> Access tokens are **short-lived (15 min)** to limit damage if stolen. Refresh tokens **(7 days)** let users get new access tokens silently without re-logging. Even if the access token is leaked via XSS, it expires in 15 minutes max.
+
+**Q10: Explain the "user enumeration" prevention in your login.**
+> Whether the email doesn't exist OR the password is wrong, I return the same message: `"Invalid email or password"`. If I returned `"Email not found"`, an attacker could enumerate valid email addresses.
+
+**Q11: Why do you verify Razorpay webhook signatures?**
+> Without signature verification, an attacker could send a fake POST to `/api/payments/webhook` claiming a payment completed, upgrading themselves to Pro for free. HMAC-SHA256 signature (using the webhook secret only Razorpay and I know) proves the event genuinely came from Razorpay.
+
+**Q12: What is the `trust proxy` setting for?**
+> Without it, `req.ip` behind a reverse proxy (Nginx, Cloudflare) would always be the proxy's IP, not the real user's IP. `app.set('trust proxy', 1)` tells Express to trust `X-Forwarded-For` header. Critical for rate limiting — otherwise you'd rate limit the proxy, blocking all users.
+
+---
+
+### Database Questions
+
+**Q13: Why is `user_id` in the urls table nullable?**
+> Anonymous users (not logged in) can still shorten URLs — it's a growth strategy (try before you sign up). `user_id = null` means anonymous. Plan limits only apply when `user_id` is present.
+
+**Q14: Why do you have both `click_count` on urls AND detailed records in analytics?**
+> **Denormalization for performance.** `click_count` is a fast integer for dashboard overview. The `analytics` table has per-click detail for granular reporting. Without this, every dashboard load would need a `COUNT(*)` on analytics — slow with millions of clicks.
+
+**Q15: Why UUID for users but BIGSERIAL for URLs?**
+> **Users:** UUID prevents sequential ID enumeration (security). Few users so UUID overhead is fine.
+> **URLs:** Hot table with potentially billions of rows. BIGSERIAL is smaller (8 bytes vs 16 bytes), faster for index lookups, auto-incremented by DB.
+
+**Q16: What is the composite index on (url_id, created_at) for?**
+> Analytics queries always look like: `WHERE url_id = 42 AND created_at >= '2024-01-01'`. The composite index serves both conditions — DB narrows by `url_id` first (high selectivity), then by time range. Index order matters — equality field (`url_id`) first.
+
+**Q17: What is `ON DELETE CASCADE` used for?**
+> If a user is deleted, all their URLs are automatically deleted. If a URL is deleted, all its analytics records are automatically deleted. Maintains referential integrity at DB level without needing DELETE cascades in application code.
+
+---
+
+### JavaScript/Node.js Questions
+
+**Q18: How do you handle errors globally?**
+> `AppError` class extends `Error` with `statusCode` and `code` fields. All service functions throw `AppError`. The `errorHandler` middleware (registered last) catches all errors — if it's an `AppError`, uses the status code; otherwise returns 500. Centralizes error formatting.
+
+**Q19: What's the difference between running the analytics worker in the same process vs separate?**
+> In **development**, `analyticsWorker.js` is `require()`d in `server.js` — runs in same process, simpler setup. In **production**, run `npm run worker` in a separate process/container so it doesn't compete for resources with the web server and can be scaled independently.
+
+**Q20: Why is `createBullConnection()` a factory function?**
+> Each BullMQ Queue and Worker needs its own dedicated Redis connection. BullMQ's connection uses blocking operations. A factory creates a fresh `ioredis` instance each time. If you shared one connection, BullMQ's blocking operations would interfere with normal Redis commands.
+
+---
+
+### Architecture Questions
+
+**Q21: What architectural pattern does this project follow?**
+> **Layered MVC with Service Layer:**
+> - Routes → entry point, apply middleware
+> - Controllers → thin HTTP handlers, no business logic
+> - Services → all business logic, DB, cache operations
+> - Utils → pure stateless helper functions
+> - Middleware → cross-cutting concerns
+> Separation of concerns makes testing easier — test services independently without HTTP.
+
+**Q22: How does the SaaS subscription model work end-to-end?**
+> 1. User clicks "Upgrade to Pro" on pricing page
+> 2. Frontend calls `POST /api/payments/subscribe`
+> 3. Server calls Razorpay API: creates subscription object with plan ID
+> 4. Razorpay subscription URL sent to frontend
+> 5. User pays via Razorpay checkout
+> 6. Razorpay fires `subscription.activated` webhook to our server
+> 7. Webhook handler updates `users.plan_type = 'pro'` in DB
+> 8. User now gets Pro rate limits and features
+
+**Q23: How does plan enforcement work for custom aliases?**
+> In `urlService.js`, `shortenUrl()` checks:
+> ```javascript
+> if (user && user.plan_type === 'free') {
+>   throw new AppError('Custom aliases require a Pro or Business plan', 403);
+> }
+> ```
+> The user's `plan_type` comes from the JWT payload (set at login). This is server-side — a client cannot bypass it.
+
+**Q24: How do you prevent IDOR (Insecure Direct Object Reference) attacks?**
+> Every DB query scopes by `user_id`:
+> ```javascript
+> db('urls').where({ id: linkId, user_id: userId })
+> ```
+> User A cannot access User B's links even if they know User B's link ID. Returns 404 (not 403) for unauthorized access — prevents confirming the resource exists.
+
+**Q25: Why do you prevent shortening already-short URLs?**
+> URL chains (short.ly → bit.ly → real URL) are used in phishing to hide destinations. Also makes analytics meaningless — you'd track clicks to the intermediate shortener. The `SHORTENER_DOMAINS` list in `urlValidator.js` blocks known shorteners.
+
+---
+
+### Behavioral Questions
+
+**Q26: What was the hardest part of building this?**
+> Getting the Express route order right. The wildcard redirect handler `/:shortCode` must come after all named routes. Early on, visiting `/dashboard` would trigger a short code lookup, find nothing, and return 404. Debugging middleware order in Express requires understanding top-to-bottom sequential processing.
+
+**Q27: What would you improve with more time?**
+> 1. **Pre-computed short code pool** in Redis for O(1) guaranteed-unique codes
+> 2. **ClickHouse/TimescaleDB** for analytics (better time-series performance)
+> 3. **Google OAuth** login (library `google-auth-library` already installed)
+> 4. **Email verification** and password reset (nodemailer + otp-generator already installed)
+> 5. **Custom domains** (users bring their own domain: `go.mycompany.com/link`)
+> 6. **Unit tests** with Jest
+> 7. **A/B testing** — split traffic between two long URLs
+
+**Q28: Why did you install `nodemailer` and `otp-generator` if they're not used?**
+> They were planned for email verification and OTP-based 2FA/password reset. The infrastructure is in place, but not implemented in this phase. Shows forward-thinking — adding email flows later won't require dependency changes.
+
+---
+
+## 14. ⚡ Quick-Fire Technical Facts
+
+| Question | Answer |
+|---|---|
+| Short code length | 5 characters |
+| Total possible short codes (5-char Base62) | 62^5 = ~916 million |
+| Cache TTL | 1 hour (3600 seconds) |
+| Access token lifetime | 15 minutes |
+| Refresh token lifetime | 7 days |
+| Free plan monthly limit | 100 links |
+| bcrypt salt rounds (users) | 12 |
+| bcrypt salt rounds (link passwords) | 10 |
+| BullMQ retry attempts | 3 with exponential backoff |
+| Analytics worker concurrency | 10 jobs in parallel |
+| Redis maxmemory (docker) | 256 MB |
+| Redis eviction policy | allkeys-lru |
+| DB connection pool (prod) | min: 2, max: 20 |
+| Snowflake epoch | 2026-01-01T00:00:00Z |
+| Max machine IDs (Snowflake) | 1024 (2^10) |
+| Max IDs per ms per machine (Snowflake) | 4096 (2^12) |
+| URL max length | 2048 characters |
+| Custom alias max length | 30 characters |
+| Custom alias min length | 3 characters |
+| Redirect type (regular links) | HTTP 301 Permanent |
+| Redirect type (one-time links) | HTTP 302 Temporary |
+
+---
+
+## 15. 🧩 Design Patterns Used
+
+| Pattern | Where | Why |
+|---|---|---|
+| **Service Layer** | `services/` | Separates business logic from HTTP handling |
+| **Factory** | `createBullConnection()`, `createRateLimiter()` | Create configured instances on demand |
+| **Middleware Chain** | Express pipeline | Composable, ordered request processing |
+| **Token Bucket** | `rateLimiter.js` | Smooth rate limiting algorithm |
+| **Write-Through Cache** | `urlService.js` | Cache updated on every write |
+| **Observer** (event-driven) | BullMQ + Worker | Decouple analytics from redirect |
+| **Webhook** | `paymentService.js` | Razorpay pushes payment events to server |
+| **Facade** | Controllers | Thin wrapper over complex service logic |
+| **Singleton** | `redis.js`, `database.js` | One shared DB/Redis connection per process |
+
+---
+
+## 16. 🏁 One-Line Project Summary (memorize this)
+
+> "NanoURL is a **production-grade URL Shortener SaaS** built with **Node.js + Express + PostgreSQL + Redis + BullMQ**. It shortens URLs with unique 5-character codes, supports **custom aliases** (Pro plan), **password protection**, **expiration**, and **one-time links**. Redirects are served in ~2ms via Redis caching, and **click analytics** (country, device, browser) are processed **asynchronously** via a BullMQ worker to avoid blocking redirects. It has a **Token Bucket rate limiter** using Redis Lua scripts, **JWT authentication** with access + refresh tokens, and **Razorpay subscription billing** for monetization."

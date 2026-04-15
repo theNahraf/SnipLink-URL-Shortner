@@ -5,3 +5,5 @@ dist/
 .DS_Store
 coverage/
 .nyc_output/
+.implementation_plan.md
+.nanourl_interview_guide.md
